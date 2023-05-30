@@ -13,7 +13,7 @@ sleep 1
 sudo insmod $KHTTPD_MOD
 
 # run HTTP benchmarking
-./htstress -n 100000 -c 1 -t 4 http://localhost:8081/
+./htstress -n 100000 -c 1 -t 4 http://localhost:8051/
 
 # epilogue
 sudo rmmod khttpd
