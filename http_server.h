@@ -11,6 +11,7 @@ struct http_server_param {
 
 struct http_service {
     bool is_stopped;
+    char *dir_path;
     struct list_head worker;
 };
 
@@ -22,4 +23,5 @@ struct khttpd {
 
 extern struct workqueue_struct *khttpd_wq;
 extern int http_server_daemon(void *arg);
+extern struct http_service daemon_list;
 #endif

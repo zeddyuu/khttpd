@@ -10,16 +10,21 @@
 
 #define DEFAULT_PORT 8051
 #define DEFAULT_BACKLOG 100
+#define DOCPATH_SIZE 100
 
 static ushort port = DEFAULT_PORT;
 module_param(port, ushort, S_IRUGO);
 static ushort backlog = DEFAULT_BACKLOG;
 module_param(backlog, ushort, S_IRUGO);
+static char WEBROOT[DOCPATH_SIZE] = {0};
+module_param_string(WEBROOT, WEBROOT, DOCPATH_SIZE, 0);
 
 static struct socket *listen_socket;
 static struct http_server_param param;
 static struct task_struct *http_server;
 struct workqueue_struct *khttpd_wq;
+struct http_service daemon_list;
+
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
 static int set_sock_opt(struct socket *sock,
@@ -160,6 +165,9 @@ static int __init khttpd_init(void)
         pr_err("can't open listen socket\n");
         return err;
     }
+    if (!*WEBROOT)
+        WEBROOT[0] = '/';
+    daemon_list.dir_path = WEBROOT;
     khttpd_wq = alloc_workqueue("khttpd", WQ_UNBOUND, 0);
     param.listen_socket = listen_socket;
     http_server = kthread_run(http_server_daemon, &param, KBUILD_MODNAME);
