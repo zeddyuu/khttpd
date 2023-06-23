@@ -165,8 +165,6 @@ static int __init khttpd_init(void)
         pr_err("can't open listen socket\n");
         return err;
     }
-    if (!*WEBROOT)
-        WEBROOT[0] = '/';
     daemon_list.dir_path = WEBROOT;
     khttpd_wq = alloc_workqueue("khttpd", WQ_UNBOUND, 0);
     param.listen_socket = listen_socket;

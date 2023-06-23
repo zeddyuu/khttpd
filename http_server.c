@@ -1,39 +1,23 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include "http_server.h"
 #include <linux/fs.h>
 #include <linux/kthread.h>
 #include <linux/sched/signal.h>
 #include <linux/tcp.h>
-
 #include "http_parser.h"
-#include "http_server.h"
+#include "mime_type.h"
 
 
 #define CRLF "\r\n"
 
-#define HTTP_RESPONSE_200_DUMMY                               \
-    ""                                                        \
-    "HTTP/1.1 200 OK" CRLF "Server: " KBUILD_MODNAME CRLF     \
-    "Content-Type: text/plain" CRLF "Content-Length: 12" CRLF \
-    "Connection: Close" CRLF CRLF "Hello World!" CRLF
-#define HTTP_RESPONSE_200_KEEPALIVE_DUMMY                     \
-    ""                                                        \
-    "HTTP/1.1 200 OK" CRLF "Server: " KBUILD_MODNAME CRLF     \
-    "Content-Type: text/plain" CRLF "Content-Length: 12" CRLF \
-    "Connection: Keep-Alive" CRLF CRLF "Hello World!" CRLF
-#define HTTP_RESPONSE_501                                              \
-    ""                                                                 \
-    "HTTP/1.1 501 Not Implemented" CRLF "Server: " KBUILD_MODNAME CRLF \
-    "Content-Type: text/plain" CRLF "Content-Length: 21" CRLF          \
-    "Connection: Close" CRLF CRLF "501 Not Implemented" CRLF
-#define HTTP_RESPONSE_501_KEEPALIVE                                    \
-    ""                                                                 \
-    "HTTP/1.1 501 Not Implemented" CRLF "Server: " KBUILD_MODNAME CRLF \
-    "Content-Type: text/plain" CRLF "Content-Length: 21" CRLF          \
-    "Connection: KeepAlive" CRLF CRLF "501 Not Implemented" CRLF
+#define SEND_HTTP_MSG(socket, buf, format, ...)           \
+    snprintf(buf, SEND_BUFFER_SIZE, format, __VA_ARGS__); \
+    http_server_send(socket, buf, strlen(buf))
 
 #define RECV_BUFFER_SIZE 4096
 #define SEND_BUFFER_SIZE 256
+#define BUFFER_SIZE 256
 
 struct http_service daemon = {.is_stopped = false,
                               .worker = LIST_HEAD_INIT(daemon.worker)};
@@ -50,6 +34,23 @@ struct http_request {
     struct work_struct khttpd_work;
 };
 
+
+
+static void catstr(char *res, char *first, char *second)
+{
+    int first_size = strlen(first);
+    int second_size = strlen(second);
+    memset(res, 0, BUFFER_SIZE);
+    memcpy(res, first, first_size);
+    memcpy(res + first_size, second, second_size);
+}
+
+static inline int read_file(struct file *fp, char *buf)
+{
+    return kernel_read(fp, buf, fp->f_inode->i_size, 0);
+}
+
+
 static int http_server_recv(struct socket *sock, char *buf, size_t size)
 {
     struct kvec iov = {.iov_base = (void *) buf, .iov_len = size};
@@ -60,6 +61,7 @@ static int http_server_recv(struct socket *sock, char *buf, size_t size)
                          .msg_flags = 0};
     return kernel_recvmsg(sock, &msg, &iov, 1, size, msg.msg_flags);
 }
+
 
 static int http_server_send(struct socket *sock, const char *buf, size_t size)
 {
@@ -84,6 +86,8 @@ static int http_server_send(struct socket *sock, const char *buf, size_t size)
     return done;
 }
 
+
+
 static int tracedir(struct dir_context *dir_context,
                     const char *name,
                     int namelen,
@@ -95,61 +99,80 @@ static int tracedir(struct dir_context *dir_context,
         struct http_request *request =
             container_of(dir_context, struct http_request, dir_context);
         char buf[SEND_BUFFER_SIZE] = {0};
-
-        snprintf(buf, SEND_BUFFER_SIZE,
-                 "<tr><td><a href=\"%s\">%s</a></td></tr>\r\n", name, name);
-        http_server_send(request->socket, buf, strlen(buf));
+        char *url =
+            !strcmp(request->request_url, "/") ? "" : request->request_url;
+        SEND_HTTP_MSG(request->socket, buf,
+                      "%lx\r\n<tr><td><a href=\"%s/%s\">%s</a></td></tr>\r\n",
+                      34 + strlen(url) + (namelen << 1), url, name, name);
     }
     return 0;
 }
 
+
+
 static bool handle_directory(struct http_request *request)
 {
     struct file *fp;
-    char buf[SEND_BUFFER_SIZE] = {0};
+    char buf[SEND_BUFFER_SIZE] = {0}, pwd[BUFFER_SIZE] = {0};
+
 
     request->dir_context.actor = tracedir;
     if (request->method != HTTP_GET) {
-        snprintf(buf, SEND_BUFFER_SIZE,
-                 "HTTP/1.1 501 Not Implemented\r\n%s%s%s%s",
-                 "Content-Type: text/plain\r\n", "Content-Length: 19\r\n",
-                 "Connection: Close\r\n", "501 Not Implemented\r\n");
-        http_server_send(request->socket, buf, strlen(buf));
+        SEND_HTTP_MSG(request->socket, buf, "%s%s%s%s%s",
+                      "HTTP/1.1 501 Not Implemented\r\n",
+                      "Content-Type: text/plain\r\n", "Content-Length: 19\r\n",
+                      "Connection: Close\r\n\r\n", "501 Not Implemented");
         return false;
     }
-
-    snprintf(buf, SEND_BUFFER_SIZE, "HTTP/1.1 200 OK\r\n%s%s%s",
-             "Connection: Keep-Alive\r\n", "Content-Type: text/html\r\n",
-             "Keep-Alive: timeout=5, max=1000\r\n\r\n");
-    http_server_send(request->socket, buf, strlen(buf));
-
-
-    snprintf(buf, SEND_BUFFER_SIZE, "%s%s%s%s", "<html><head><style>\r\n",
-             "body{font-family: monospace; font-size: 15px;}\r\n",
-             "td {padding: 1.5px 6px;}\r\n",
-             "</style></head><body><table>\r\n");
-    http_server_send(request->socket, buf, strlen(buf));
-
-    fp = filp_open(daemon_list.dir_path, O_RDONLY | O_DIRECTORY, 0);
+    catstr(pwd, daemon_list.dir_path, request->request_url);
+    fp = filp_open(pwd, O_RDONLY, 0);
     if (IS_ERR(fp)) {
-        pr_info("Open file failed");
+        SEND_HTTP_MSG(request->socket, buf, "%s%s%s%s%s",
+                      "HTTP/1.1 404 Not Found\r\n",
+                      "Content-Type: text/plain\r\n", "Content-Length: 13\r\n",
+                      "Connection: Close\r\n\r\n", "404 Not Found");
         return false;
     }
 
-    iterate_dir(fp, &request->dir_context);
-    snprintf(buf, SEND_BUFFER_SIZE, "</table></body></html>\r\n");
-    http_server_send(request->socket, buf, strlen(buf));
+    if (S_ISDIR(fp->f_inode->i_mode)) {
+        SEND_HTTP_MSG(request->socket, buf, "%s%s%s", "HTTP/1.1 200 OK\r\n",
+                      "Content-Type: text/html\r\n",
+                      "Transfer-Encoding: chunked\r\n\r\n");
+        SEND_HTTP_MSG(
+            request->socket, buf, "7B\r\n%s%s%s%s", "<html><head><style>\r\n",
+            "body{font-family: monospace; font-size: 15px;}\r\n",
+            "td {padding: 1.5px 6px;}\r\n", "</style></head><body><table>\r\n");
+
+        iterate_dir(fp, &request->dir_context);
+
+
+        SEND_HTTP_MSG(request->socket, buf, "%s",
+                      "16\r\n</table></body></html>\r\n");
+        SEND_HTTP_MSG(request->socket, buf, "%s", "0\r\n\r\n");
+
+    } else if (S_ISREG(fp->f_inode->i_mode)) {
+        char *read_data = kmalloc(fp->f_inode->i_size, GFP_KERNEL);
+        int ret = read_file(fp, read_data);
+
+        SEND_HTTP_MSG(
+            request->socket, buf, "%s%s%s%s%d%s", "HTTP/1.1 200 OK\r\n",
+            "Content-Type: ", get_mime_str(request->request_url),
+            "\r\nContent-Length: ", ret, "\r\nConnection: Close\r\n\r\n");
+        http_server_send(request->socket, read_data, ret);
+        kfree(read_data);
+    }
     filp_close(fp, NULL);
     return true;
 }
 
 static int http_server_response(struct http_request *request, int keep_alive)
 {
-    int ret = handle_directory(request);
-    if (!ret)
+    if (handle_directory(request) > 0)
         printk("Error\n");
     return 0;
 }
+
+
 
 static int http_parser_callback_message_begin(http_parser *parser)
 {
